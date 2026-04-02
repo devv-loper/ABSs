@@ -2,68 +2,79 @@ import logging
 import re
 import asyncio
 import time
+import os
+import json
 from typing import Any, Optional, List
+from urllib.parse import urlparse
 from browser_use import Agent
 from .config import SecurityConfig
 from .reputation import ReputationManager
 from .event_logger import SecurityLogger
+from .risk_scorer import RiskScorer
 
 # Configure logging
 logger = logging.getLogger("security.agent")
 
+
 class SecureAgent(Agent):
     """
     A secure wrapper around the Browser Use Agent.
-    Implements the "Zero-Trust Guardian" architecture.
+    Implements a defense-in-depth "Zero-Trust Guardian" architecture.
+    
+    Security Layers:
+      Layer 0: Constitutional AI (hardened system prompt — set in main_secure.py)
+      Layer 1: DOM Sanitization Lens (pre-execution content filtering)
+      Layer 2: Action Sentinel (in-execution action mediation + risk scoring)
+      Layer 3: Network Firewall (honey token DLP + cross-origin blocking)
+      Layer 4: Explainable AI (LLM-generated explanations for blocked actions)
     """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.security_manager = ReputationManager()
         self.security_state = "UNKNOWN"
         self.last_evidence_path = None
-        self.HONEY_TOKEN = "4000-1234-5678-9010" 
+        self.HONEY_TOKEN = "4000-1234-5678-9010"
         
+        # Initialize risk scorer with user task context
+        self.risk_scorer = RiskScorer(user_task=self.task if hasattr(self, 'task') else "")
+
+        # Track the LLM for XAI explanation calls
+        self._xai_llm = kwargs.get('llm', None)
+
         # Load Defense JS
         try:
-             import os
-             js_path = os.path.join(os.path.dirname(__file__), 'defense.js')
-             with open(js_path, 'r', encoding='utf-8') as f:
-                 self.defense_script = f.read()
+            js_path = os.path.join(os.path.dirname(__file__), 'defense.js')
+            with open(js_path, 'r', encoding='utf-8') as f:
+                self.defense_script = f.read()
         except Exception as e:
-             logger.error(f"Failed to load defense.js: {e}")
-             self.defense_script = ""
+            logger.error(f"Failed to load defense.js: {e}")
+            self.defense_script = ""
 
-        # Verify we have access to the browser session/context to hook network
-        if hasattr(self, 'browser_context'):
-             # We can hook the network here if the context is already active? 
-             # Usually context is created in super().__init__ or later. 
-             # We might need to do this in the patcher.
-             pass
-             
         self._patch_browser_session()
+
+    # =====================================================================
+    #  LAYER 3: NETWORK FIREWALL (Honey Token DLP + Cross-Origin Blocking)
+    # =====================================================================
 
     async def _intercept_network(self, route, request):
         """
-        Feature 3: The Data Leak Trap (Honey Token) & Firewall
+        Network-level security: DLP honey token detection and cross-origin blocking.
         """
-        # Block risky resources
+        # Block risky resource types
         if request.resource_type in ["font", "media"]:
-             await route.abort()
-             return
+            await route.abort()
+            return
 
-        # Check for Data Leaks (Honey Token)
-        risk_score = 0
-        leak_detected = False
+        # --- DLP: Check for Honey Token leakage ---
         post_data = request.post_data or ""
-        
-        # Check URL, Headers, Body
+        leak_detected = False
+
         if (self.HONEY_TOKEN in request.url) or \
            (self.HONEY_TOKEN in str(request.headers)) or \
            (self.HONEY_TOKEN in post_data):
-            
-            risk_score = 200
             leak_detected = True
-        
+
         if leak_detected:
             logger.critical(f"🛑 DATA LEAK DETECTED: {self.HONEY_TOKEN}")
             self.last_evidence_path = await self._capture_evidence()
@@ -72,11 +83,44 @@ class SecureAgent(Agent):
                 url=request.url,
                 details=f"Blocked transmission of Honey Token ({self.HONEY_TOKEN}) to external server in {request.resource_type}",
                 risk_level="CRITICAL",
+                risk_score=99,
                 action="BLOCKED",
-                screenshot_path=self.last_evidence_path
+                screenshot_path=self.last_evidence_path,
+                explanation="The agent attempted to transmit a tracked credential (honey token) outside the trusted boundary. This is a strong indicator of credential exfiltration, likely triggered by a phishing form or invisible data-harvesting script."
             )
             await route.abort()
             return
+
+        # --- Cross-Origin Form Submission Blocking ---
+        if request.method == "POST" and request.resource_type in ["document", "xhr", "fetch"]:
+            try:
+                page = getattr(self.browser_session, 'page', None)
+                if page:
+                    current_origin = urlparse(page.url).netloc.split(":")[0]
+                    request_origin = urlparse(request.url).netloc.split(":")[0]
+                    
+                    if current_origin and request_origin and current_origin != request_origin:
+                        # Cross-origin POST — this is suspicious
+                        current_root = ".".join(current_origin.split(".")[-2:])
+                        request_root = ".".join(request_origin.split(".")[-2:])
+                        
+                        if current_root != request_root:
+                            logger.warning(f"🛑 Cross-origin POST blocked: {current_origin} → {request_origin}")
+                            self.last_evidence_path = await self._capture_evidence()
+                            SecurityLogger.log_event(
+                                event_type="CROSS_ORIGIN_BLOCKED",
+                                url=request.url,
+                                details=f"Blocked cross-origin form submission from {current_origin} to {request_origin}",
+                                risk_level="CRITICAL",
+                                risk_score=92,
+                                action="BLOCKED",
+                                screenshot_path=self.last_evidence_path,
+                                explanation=f"A form on {current_origin} attempted to submit data to a completely different domain ({request_origin}). This is a classic indicator of a phishing attack or data exfiltration attempt where a malicious form hijacks user input."
+                            )
+                            await route.abort()
+                            return
+            except Exception as e:
+                logger.debug(f"Cross-origin check error: {e}")
 
         await route.continue_()
 
@@ -93,21 +137,23 @@ class SecureAgent(Agent):
             logger.error(f"Failed to capture evidence: {e}")
             return None
 
+    # =====================================================================
+    #  LAYER 1: DOM SANITIZATION LENS (Pre-Execution Content Filtering)
+    # =====================================================================
+
     def _patch_browser_session(self):
         """
-        Layer 1: The Sanitization Lens.
         Patches the browser session to interpret the DOM through a security filter.
+        All web content passes through sanitization before reaching the LLM.
         """
         original_get_state = self.browser_session.get_browser_state_summary
 
         async def secure_get_state(*args, **kwargs):
-            # 0. Inject Defense Mechanism (Client-Side Watchdog)
-            # We try to inject the Sentinel JS to detect client-side vectors
+            # --- Inject Client-Side Defense JS (Sentinel Watchdog) ---
+            js_threats = []
             try:
-                # Access the underlying Playwright Page object
-                # BrowserSession usually exposes it as 'page' or via context
                 page = getattr(self.browser_session, 'page', None)
-                
+
                 # Setup Network Interception if not already done
                 if page and not getattr(self, '_network_hooked', False):
                     await page.context.route("**/*", self._intercept_network)
@@ -117,27 +163,17 @@ class SecureAgent(Agent):
                 if page and self.defense_script:
                     # Inject Sentinel Library
                     await page.evaluate(self.defense_script)
-                    
-                    # Wait for renderer to settle (ensure styles are computed)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
 
-                    # Run Active Scan (Trigger Sentinel on all elements)
+                    # Run Active Scan
                     scan_script = """
                     (function() {
                         if (!window.Sentinel) return [{type: 'SYSTEM', details: 'Sentinel JS failed to load'}];
                         
                         const vulnerabilities = [];
-                        
-                        // 1. Tag Hidden/Dangerous Elements
                         const all = document.querySelectorAll('*');
                         all.forEach(el => {
-                            // Skip if already logged to avoid spam
-                            // But allow re-checking if new threats appear? 
-                            // We use specific attributes per threat type to allow multi-vector detection on one element
-                            
-                            // ---------------------------------------------------------
-                            // DETECTOR 1: DYNAMIC INJECTION (MutationObserver Results)
-                            // ---------------------------------------------------------
+                            // DETECTOR 1: Dynamic Injection (MutationObserver Results)
                             if (el.getAttribute('data-sentinel-suspicious') === 'true' && !el.getAttribute('data-sentinel-dynamic-logged')) {
                                 el.setAttribute('data-sentinel-dynamic-logged', 'true');
                                 vulnerabilities.push({
@@ -147,286 +183,448 @@ class SecureAgent(Agent):
                                 });
                             }
 
-                            // ---------------------------------------------------------
-                            // DETECTOR 2: PHISHING (Form Analysis)
-                            // ---------------------------------------------------------
+                            // DETECTOR 2: Phishing (Form Analysis)
                             if (el.tagName === 'INPUT' && (el.name.includes('card') || el.id.includes('cc-'))) {
-                                 if (!el.getAttribute('data-sentinel-phishing-logged')) {
-                                     el.setAttribute('data-sentinel-phishing-logged', 'true');
-                                     vulnerabilities.push({
-                                         type: 'PHISHING_CONTENT_DETECTED', 
-                                         details: 'Vector 5: Suspicious Credit Card Input Form',
-                                         risk_score: 90
-                                     });
-                                 }
+                                if (!el.getAttribute('data-sentinel-phishing-logged')) {
+                                    el.setAttribute('data-sentinel-phishing-logged', 'true');
+                                    vulnerabilities.push({
+                                        type: 'PHISHING_CONTENT_DETECTED', 
+                                        details: 'Vector 5: Suspicious Credit Card Input Form',
+                                        risk_score: 90
+                                    });
+                                }
                             }
 
-                            // ---------------------------------------------------------
-                            // DETECTOR 3: VISIBILITY & CLICKJACKING
-                            // ---------------------------------------------------------
-                            if (el.getAttribute('data-sentinel-logged')) return;
+                            // DETECTOR 3: Cross-Origin Forms
+                            if (el.tagName === 'FORM' && !el.getAttribute('data-sentinel-form-logged')) {
+                                var action = el.getAttribute('action') || '';
+                                if (action.startsWith('http') && !action.includes(window.location.hostname)) {
+                                    el.setAttribute('data-sentinel-form-logged', 'true');
+                                    el.style.border = '4px solid red';
+                                    vulnerabilities.push({
+                                        type: 'CROSS_ORIGIN_FORM',
+                                        details: 'Suspicious form submitting to external domain: ' + action.substring(0, 60),
+                                        risk_score: 88
+                                    });
+                                }
+                            }
 
+                            // DETECTOR 4: Iframe Overlays
+                            if (el.tagName === 'IFRAME' && !el.getAttribute('data-sentinel-iframe-logged')) {
+                                var iStyle = window.getComputedStyle(el);
+                                var iOpacity = parseFloat(iStyle.opacity);
+                                if (iOpacity < 0.2 || iStyle.position === 'absolute' || iStyle.position === 'fixed') {
+                                    el.setAttribute('data-sentinel-iframe-logged', 'true');
+                                    el.style.border = '5px solid red';
+                                    el.style.pointerEvents = 'none';
+                                    vulnerabilities.push({
+                                        type: 'IFRAME_OVERLAY_DETECTED',
+                                        details: 'Suspicious invisible/positioned iframe detected (potential clickjacking)',
+                                        risk_score: 85
+                                    });
+                                }
+                            }
+
+                            // DETECTOR 5: Visibility & Clickjacking
+                            if (el.getAttribute('data-sentinel-logged')) return;
                             let result = 'VISIBLE';
                             try {
                                 result = window.Sentinel.checkVisibility(el);
                             } catch(e) { return; }
                             
                             if (result !== 'VISIBLE' && result !== 'SAFE_HIDDEN' && result !== 'NOT_FOUND' && result !== 'COMPLEX') {
-                                 
-                                 // Vector 1: Hidden Prompt Injection -> REDACT & REVEAL WARNING
-                                 if (result === 'HIDDEN_PROMPT_INJECTION') {
-                                     el.setAttribute('data-sentinel-logged', 'true');
-                                     vulnerabilities.push({
-                                         type: 'INJECTION_ATTEMPT', 
-                                         details: 'Vector 2: Hidden Prompt Injection detected & sanitized', 
-                                         risk_score: 95
-                                     });
-                                     // Visual Redaction (Sanitization)
-                                     el.innerText = '[🛑 BLOCKED PROMPT INJECTION]';
-                                     el.style.color = 'white'; el.style.backgroundColor = 'red'; el.style.display = 'block'; el.style.visibility = 'visible'; el.style.zIndex = '10000';
-                                 }
-
-                                 // Vector 2: Hidden CSS (Tiny text, invisible ink, opacity)
-                                 else if (result.startsWith('TINY_TEXT') || result.startsWith('INVISIBLE_INK') || result.startsWith('HIDDEN_OPACITY')) {
-                                      el.setAttribute('data-sentinel-logged', 'true');
-                                      el.style.border = '3px dotted orange';
-                                      vulnerabilities.push({
-                                          type: 'DECEPTIVE_UI_DETECTED', 
-                                          details: 'Hidden CSS / Obfuscation: ' + result,
-                                          risk_score: 70
-                                      });
-                                 }
-                                 
-                                 // Vector 3: Clickjacking / Invisible Overlay
-                                 else if (result === 'BLOCKED_BY_INVISIBLE_OVERLAY') {
-                                      el.setAttribute('data-sentinel-logged', 'true');
-                                      el.style.border = '5px solid red';
-                                      vulnerabilities.push({
-                                          type: 'CLICKJACKING_ATTEMPT', 
-                                          details: 'Vector 3: Invisible Overlay / Clickjacking Blocked', 
-                                          risk_score: 90
-                                      });
-                                 }
+                                if (result === 'HIDDEN_PROMPT_INJECTION') {
+                                    el.setAttribute('data-sentinel-logged', 'true');
+                                    vulnerabilities.push({
+                                        type: 'INJECTION_ATTEMPT', 
+                                        details: 'Vector 2: Hidden Prompt Injection detected & sanitized', 
+                                        risk_score: 95
+                                    });
+                                    el.innerText = '[🛑 BLOCKED PROMPT INJECTION]';
+                                    el.style.color = 'white'; el.style.backgroundColor = 'red'; el.style.display = 'block'; el.style.visibility = 'visible'; el.style.zIndex = '10000';
+                                }
+                                else if (result.startsWith('TINY_TEXT') || result.startsWith('INVISIBLE_INK') || result.startsWith('HIDDEN_OPACITY')) {
+                                    el.setAttribute('data-sentinel-logged', 'true');
+                                    el.style.border = '3px dotted orange';
+                                    vulnerabilities.push({
+                                        type: 'DECEPTIVE_UI_DETECTED', 
+                                        details: 'Hidden CSS / Obfuscation: ' + result,
+                                        risk_score: 70
+                                    });
+                                }
+                                else if (result === 'BLOCKED_BY_INVISIBLE_OVERLAY') {
+                                    el.setAttribute('data-sentinel-logged', 'true');
+                                    el.style.border = '5px solid red';
+                                    vulnerabilities.push({
+                                        type: 'CLICKJACKING_ATTEMPT', 
+                                        details: 'Vector 3: Invisible Overlay / Clickjacking Blocked', 
+                                        risk_score: 90
+                                    });
+                                }
                             }
                         });
                         return vulnerabilities;
                     })();
                     """
-                    threats = await page.evaluate(scan_script)
+                    js_threats = await page.evaluate(scan_script) or []
 
-                    # Log any detected threats to the Dashboard
-                    if threats:
-                        self.last_evidence_path = await self._capture_evidence()
-                        for threat in threats:
-                            logger.warning(f"🛡️ Sentinel DETECTED: {threat['details']}")
-                            SecurityLogger.log_event(
-                                event_type=threat['type'],
-                                url=summary.url,
-                                details=threat['details'],
-                                risk_level="CRITICAL",
-                                risk_score=threat.get('risk_score', 90), # Use dynamic score
-                                action="SANITIZED" if "INJECTION" in threat['type'] else "BLOCKED",
-                                screenshot_path=self.last_evidence_path 
-                            )
             except Exception as e:
-                # Don't crash the agent if injection fails
-                logger.error(f"Defense Injection Failed: {e}") 
+                logger.error(f"Defense Injection Failed: {e}")
 
-
-            # 1. Get the Raw State
+            # --- Get the Raw Browser State ---
             summary = await original_get_state(*args, **kwargs)
-            
-            threats = None # Initialize threats variable prevents UnboundLocalError
-            
-            # 2. Update Security State based on URL
-            is_safe = self.security_manager.check_reputation(summary.url)
-            self.security_state = "TRUSTED" if is_safe else "HOSTILE"
-            
-            # Log only on state change or significant events to reduce spam
-            threats_found_in_session = (threats is not None and len(threats) > 0)
-            
-            if threats_found_in_session:
-                 pass # Already logged threats, no need for generic warning
-            elif not getattr(self, 'last_logged_url', None) == summary.url:
-                self.last_logged_url = summary.url
-                logger.info(f"Security State for {summary.url}: {self.security_state}")
 
-                if is_safe:
+            # --- Log JS-detected threats ---
+            if js_threats:
+                self.last_evidence_path = await self._capture_evidence()
+                for threat in js_threats:
+                    if threat.get('type') == 'SYSTEM':
+                        continue
+                    logger.warning(f"🛡️ Sentinel DETECTED: {threat['details']}")
                     SecurityLogger.log_event(
-                        event_type="REPUTATION_CHECK",
-                        url=summary.url,
-                        details="Domain verified as Trusted.",
-                        risk_level="SAFE",
-                        risk_score=0, # ADDED SCORE
-                        action="ALLOWED"
+                        event_type=threat['type'],
+                        url=summary.url if hasattr(summary, 'url') else "unknown",
+                        details=threat['details'],
+                        risk_level="CRITICAL",
+                        risk_score=threat.get('risk_score', 90),
+                        action="SANITIZED" if "INJECTION" in threat['type'] else "BLOCKED",
+                        screenshot_path=self.last_evidence_path
                     )
-                else:
-                    SecurityLogger.log_event(
-                        event_type="REPUTATION_WARNING",
-                        url=summary.url,
-                        details="Domain flagged as Hostile/Untrusted. Engaging defenses.",
-                        risk_level="HIGH",
-                        risk_score=75, # ADDED SCORE
-                        action="WARNED"
-                    )
-            
-            # 3. If Hostile, Sanitize the DOM Representation
+
+            # --- Update Security State based on URL ---
+            current_url = summary.url if hasattr(summary, 'url') else ""
+            # Treat about:blank and empty URLs as neutral (not hostile)
+            if not current_url or current_url in ('about:blank', '', 'about:srcdoc'):
+                self.security_state = "UNKNOWN"
+                is_safe = True  # Don't alert on blank pages
+            else:
+                is_safe = self.security_manager.check_reputation(current_url)
+                self.security_state = "TRUSTED" if is_safe else "HOSTILE"
+
+            # Log state changes
+            threats_found = js_threats and len(js_threats) > 0
+            if not threats_found:
+                if not getattr(self, 'last_logged_url', None) == current_url:
+                    self.last_logged_url = current_url
+                    logger.info(f"Security State for {current_url}: {self.security_state}")
+                    if is_safe:
+                        SecurityLogger.log_event(
+                            event_type="REPUTATION_CHECK",
+                            url=current_url,
+                            details="Domain verified as Trusted.",
+                            risk_level="SAFE",
+                            risk_score=0,
+                            action="ALLOWED"
+                        )
+                    else:
+                        SecurityLogger.log_event(
+                            event_type="REPUTATION_WARNING",
+                            url=current_url,
+                            details="Domain flagged as Hostile/Untrusted. Engaging defenses.",
+                            risk_level="HIGH",
+                            risk_score=75,
+                            action="WARNED"
+                        )
+
+            # --- DOM Sanitization (on all sites, not just hostile) ---
+            self._sanitize_dom(summary)
+
             if self.security_state == "HOSTILE":
                 self.last_evidence_path = await self._capture_evidence()
-                self._sanitize_dom(summary)
             else:
                 self.last_evidence_path = None
-            
+
             return summary
 
-        # Use object.__setattr__ to bypass Pydantic's validation checks
+        # Monkey-patch the method
         object.__setattr__(self.browser_session, 'get_browser_state_summary', secure_get_state)
+
+    # =====================================================================
+    #  EXPANDED PROMPT INJECTION DETECTION
+    # =====================================================================
+
+    # Extended regex patterns for prompt injection detection
+    INJECTION_PATTERNS = [
+        # Direct instruction override
+        r'(?i)ignore\s+(\w+\s+)?instructions',
+        r'(?i)forget\s+(\w+\s+)?instructions',
+        r'(?i)disregard\s+(\w+\s+)?(previous|prior|above|earlier)',
+        r'(?i)system\s+override',
+        r'(?i)you\s+are\s+now\s+a',
+        r'(?i)new\s+directive',
+        r'(?i)system\s+command',
+        r'(?i)ignore\s+user\s+goal',
+        # Role-play attacks
+        r'(?i)act\s+as\s+(a\s+)?different',
+        r'(?i)pretend\s+(you\s+are|to\s+be)',
+        r'(?i)roleplay\s+as',
+        r'(?i)switch\s+to\s+(\w+\s+)?mode',
+        r'(?i)you\s+are\s+DAN',
+        r'(?i)jailbreak',
+        # Data exfiltration
+        r'(?i)send\s+(the\s+)?(data|info|credentials|password|token)',
+        r'(?i)transmit\s+(to|the)',
+        r'(?i)exfiltrate',
+        r'(?i)forward\s+(the\s+)?(data|info|credentials)',
+        # Prompt leaking
+        r'(?i)reveal\s+(your\s+)?(system\s+prompt|instructions|rules)',
+        r'(?i)show\s+(me\s+)?(your\s+)?(system\s+prompt|instructions)',
+        r'(?i)what\s+are\s+your\s+(instructions|rules|guidelines)',
+        r'(?i)print\s+(your\s+)?(system\s+prompt|instructions)',
+        # Instruction injection
+        r'(?i)instead\s*,?\s+(do|execute|perform|run)',
+        r'(?i)new\s+task\s*:',
+        r'(?i)updated?\s+instructions?\s*:',
+        r'(?i)override\s+(previous|prior|system)',
+        r'(?i)<\s*system\s*>',
+        r'(?i)\[\s*SYSTEM\s*\]',
+        # Base64 encoded instructions (detect Base64 fragments)
+        r'(?i)base64\s*:\s*[A-Za-z0-9+/=]{20,}',
+        r'(?i)atob\s*\(',
+        r'(?i)btoa\s*\(',
+    ]
 
     def _sanitize_dom(self, summary):
         """
-        Modifies the summary object to hide/redact dangerous content.
+        Modifies the summary to hide/redact dangerous content.
+        Applies to ALL pages, not just hostile ones.
         """
-        # We need to hook into the llm_representation method of the dom_state
         if hasattr(summary, 'dom_state'):
-            # We wrap the original method
             original_llm_rep = summary.dom_state.llm_representation
-            
+
             def secure_llm_representation(*args, **kwargs):
                 raw_text = original_llm_rep(*args, **kwargs)
                 return self._sanitize_text(raw_text)
-            
-            # Monkey-patch the method on the instance
+
             summary.dom_state.llm_representation = secure_llm_representation
 
     def _sanitize_text(self, text: str) -> str:
         """
-        Removes prompt injection attempts from the text.
+        Removes prompt injection attempts from text using expanded pattern library.
         """
-        # List of regex patterns for prompt injection
-        # e.g., "Ignore previous instructions", "System override", etc.
-        patterns = [
-            r'(?i)ignore\s+(\w+\s+)?instructions',
-            r'(?i)forget\s+(\w+\s+)?instructions',
-            r'(?i)system\s+override',
-            r'(?i)you\s+are\s+now\s+a',
-        ]
-        
         sanitized = text
-        for pattern in patterns:
+        for pattern in self.INJECTION_PATTERNS:
             match = re.search(pattern, sanitized)
             if match:
-                logger.warning(f"Sanitizer: Detected potential injection matching '{pattern}'")
+                matched_text = match.group(0)
+                logger.warning(f"🛡️ Sanitizer: Detected injection '{matched_text}' (pattern: {pattern[:40]}...)")
                 SecurityLogger.log_event(
                     event_type="INJECTION_ATTEMPT",
                     url="[Current DOM]",
-                    details=f"Blocked prompt injection matching pattern: '{pattern}'",
+                    details=f"Blocked prompt injection: '{matched_text}' (pattern: {pattern[:50]})",
                     risk_level="CRITICAL",
                     risk_score=95,
                     action="SANITIZED",
-                    screenshot_path=self.last_evidence_path
+                    screenshot_path=self.last_evidence_path,
+                    explanation=f"The text '{matched_text}' on this page is an attempt to override the agent's instructions. This is a prompt injection attack designed to make the agent ignore its safety rules and follow malicious commands embedded in the webpage."
                 )
-                sanitized = re.sub(pattern, '[BLOCKED_INJECTION_ATTEMPT]', sanitized)
-        
+                sanitized = re.sub(pattern, '[🛑 BLOCKED_INJECTION_ATTEMPT]', sanitized)
+
         return sanitized
+
+    # =====================================================================
+    #  LAYER 2: ACTION SENTINEL (Risk-Scored Action Mediation)
+    # =====================================================================
 
     async def _execute_actions(self):
         """
-        Layer 2: The Action Sentinel.
-        Intercepts and validates actions before execution.
+        Intercepts and validates all agent actions before execution.
+        Uses dynamic risk scoring for each action.
         """
         if self.state.last_model_output and self.state.last_model_output.action:
-             # Validate actions
-             approved_actions = []
-             blocked_count = 0
-             
-             for index, action in enumerate(self.state.last_model_output.action):
-                 if self._validate_action(action):
-                     approved_actions.append(action)
-                 else:
-                     logger.warning(f"Sentinel: Blocked action {index} due to security policy.")
-                     blocked_count += 1
-             
-             if blocked_count > 0:
-                 logger.info(f"Sentinel: Blocked {blocked_count} dangerous actions.")
-             
-             self.state.last_model_output.action = approved_actions
+            approved_actions = []
+            blocked_count = 0
+
+            for index, action in enumerate(self.state.last_model_output.action):
+                validation_result = self._validate_action_with_risk(action)
+                
+                if validation_result["approved"]:
+                    approved_actions.append(action)
+                    
+                    # Log medium-risk actions for monitoring
+                    if validation_result.get("risk_level") == "MEDIUM":
+                        logger.info(
+                            f"⚠️ Sentinel: Action {index} approved with elevated monitoring "
+                            f"(Risk: {validation_result.get('risk_score', '?')}/100)"
+                        )
+                else:
+                    blocked_count += 1
+                    logger.warning(
+                        f"🛑 Sentinel: BLOCKED action {index} "
+                        f"(Risk: {validation_result.get('risk_score', '?')}/100, "
+                        f"Reason: {validation_result.get('reason', 'policy violation')})"
+                    )
+
+                    # Generate XAI explanation for blocked actions
+                    await self._generate_xai_explanation(action, validation_result)
+
+            if blocked_count > 0:
+                logger.info(f"🛡️ Sentinel: Blocked {blocked_count} dangerous action(s).")
+
+            self.state.last_model_output.action = approved_actions
 
         return await super()._execute_actions()
 
-    def _validate_action(self, action_model) -> bool:
+    def _validate_action_with_risk(self, action_model) -> dict:
         """
-        Returns True if action is safe to execute.
+        Validates an action using dynamic risk scoring.
+        Returns dict with 'approved', 'risk_score', 'risk_level', 'reason'.
         """
-        # If we are in a TRUSTED state, we allow most things
-        if self.security_state == "TRUSTED":
-            return True
-        
-        # In HOSTILE state, we are strictly validating
-        
         try:
-            # We dump the action model to a dict to inspect it
-            # structure: {'click_element': {'index': 12}, 'input_text': {...}}
             action_data = action_model.model_dump(exclude_none=True)
-            
+
             for action_name, params in action_data.items():
-                # Policy 1: No downloading files from Hostile sites
-                # (Assuming there might be a 'download' action or similar, or checking specific logic)
+                if params is None:
+                    continue
+
+                # Ensure params is a dict
+                if not isinstance(params, dict):
+                    params = {}
+
+                # --- Hard Policy Checks (always enforced regardless of risk score) ---
                 
-                # Policy 2: Input Text Restrictions
-                if action_name == 'input_text':
+                # Policy: Block sensitive keyword input on hostile sites
+                if action_name == 'input_text' and self.security_state == "HOSTILE":
                     text = params.get('text', '')
-                    # Check for sensitive data leakage
-                    if any(x in text.lower() for x in ["password", "credit", "card", "ssn"]):
-                         SecurityLogger.log_event(
+                    sensitive_keywords = ["password", "credit", "card", "ssn", "cvv", "secret", "token"]
+                    if any(kw in text.lower() for kw in sensitive_keywords):
+                        SecurityLogger.log_event(
                             event_type="DATA_LEAK_PREVENTION",
-                            url="[Action Intersection]",
-                            details=f"Blocked attempt to input sensitive keywords: {text[:20]}...",
+                            url="[Action Interception]",
+                            details=f"Blocked input of sensitive data on hostile site: {text[:30]}...",
                             risk_level="CRITICAL",
                             risk_score=99,
                             action="BLOCKED",
-                            screenshot_path=self.last_evidence_path
+                            screenshot_path=self.last_evidence_path,
+                            explanation=f"The agent attempted to type sensitive information ('{text[:20]}...') into a form on an untrusted/hostile website. This was blocked to prevent credential theft or data exfiltration."
                         )
-                         return False
+                        return {
+                            "approved": False,
+                            "risk_score": 99,
+                            "risk_level": "CRITICAL",
+                            "reason": f"Sensitive data input on hostile site blocked"
+                        }
 
-                    # Check for SQL Injection patterns or similar common exploits outgoing from the agent
-                    # (Preventing the agent from becoming an attacker or leaking data)
-                    if "DROP TABLE" in text.upper() or "SELECT *" in text.upper():
-                        logger.warning(f"Sentinel: Blocked SQL-like input: {text}")
-                        SecurityLogger.log_event(
-                            event_type="ACTION_BLOCKED",
-                            url="N/A",
-                            details=f"Blocked potentially malicious SQL output: {text[:50]}...",
-                            risk_level="HIGH",
-                            risk_score=85,
-                            action="BLOCKED",
-                            screenshot_path=self.last_evidence_path
-                        )
-                        return False
-                
-                # Policy 3: Open Tab / Navigation Restrictions
-                if action_name in ['open_tab', 'navigate', 'go_to_url']:
-                    url = params.get('url', '')
-                    # Scan the target URL before opening
-                    # MODIFIED FOR DEMO: Allow navigation but WARN if it's hostile. 
-                    # Only block fully malicious (VirusTotal detected) sites if we had that data.
-                    # Since we want to DEMO the sanitization, we permit entry but log heavily.
-                    reputation_safe = self.security_manager.check_reputation(url)
-                    if not reputation_safe:
-                        logger.warning(f"Sentinel: ⚠️  Entering HOSTILE territory: {url}. Engaging Paranoid Mode.")
-                        SecurityLogger.log_event(
-                            event_type="NAVIGATION_WARNING",
-                            url=url,
-                            details="Agent attempting to enter Untrusted Zone.",
-                            risk_level="MEDIUM",
-                            risk_score=60,
-                            action="MONITORED",
-                            screenshot_path=self.last_evidence_path
-                        )
-                        # We allow it so we can show off the sanitization layer working
-                        return True 
-                    
-            return True
-            
+                # Policy: Block SQL injection patterns in any input
+                if action_name == 'input_text':
+                    text = params.get('text', '')
+                    sql_patterns = [
+                        r"(?i)DROP\s+TABLE", r"(?i)SELECT\s+\*", r"(?i)DELETE\s+FROM",
+                        r"(?i)INSERT\s+INTO", r"(?i)UPDATE\s+\w+\s+SET",
+                        r"(?i)UNION\s+SELECT", r"(?i);\s*DROP", r"(?i)OR\s+1\s*=\s*1",
+                        r"(?i)'\s*OR\s+'", r"(?i)--\s*$",
+                    ]
+                    for sql_pat in sql_patterns:
+                        if re.search(sql_pat, text):
+                            logger.warning(f"🛑 Sentinel: Blocked SQL injection: {text[:40]}")
+                            SecurityLogger.log_event(
+                                event_type="SQL_INJECTION_BLOCKED",
+                                url="[Action Interception]",
+                                details=f"Blocked SQL injection pattern in input: {text[:50]}",
+                                risk_level="CRITICAL",
+                                risk_score=95,
+                                action="BLOCKED",
+                                screenshot_path=self.last_evidence_path,
+                                explanation=f"The input text '{text[:30]}...' contains SQL injection patterns that could manipulate databases if submitted to a web form. This was blocked to prevent the agent from being used as an attack vector."
+                            )
+                            return {
+                                "approved": False,
+                                "risk_score": 95,
+                                "risk_level": "CRITICAL",
+                                "reason": f"SQL injection pattern detected: {sql_pat}"
+                            }
+
+                # --- Dynamic Risk Scoring ---
+                current_url = getattr(self, 'last_logged_url', '') or ''
+                risk_result = self.risk_scorer.calculate_risk(
+                    action_name=action_name,
+                    action_params=params,
+                    current_url=current_url,
+                    security_state=self.security_state,
+                )
+
+                risk_score = risk_result["score"]
+                risk_level = risk_result["level"]
+                recommendation = risk_result["recommendation"]
+
+                # Log the risk assessment
+                SecurityLogger.log_event(
+                    event_type="RISK_ASSESSMENT",
+                    url=current_url,
+                    details=f"Action '{action_name}' scored {risk_score}/100 ({risk_level}). Breakdown: {json.dumps(risk_result['breakdown'])}",
+                    risk_level=risk_level,
+                    risk_score=risk_score,
+                    action=recommendation
+                )
+
+                if recommendation == "BLOCK_AND_ESCALATE":
+                    return {
+                        "approved": False,
+                        "risk_score": risk_score,
+                        "risk_level": risk_level,
+                        "reason": f"Risk score {risk_score}/100 exceeds threshold. Breakdown: {risk_result['breakdown']}",
+                        "breakdown": risk_result["breakdown"],
+                    }
+
+                return {
+                    "approved": True,
+                    "risk_score": risk_score,
+                    "risk_level": risk_level,
+                }
+
+            return {"approved": True, "risk_score": 0, "risk_level": "LOW"}
+
         except Exception as e:
             logger.error(f"Error validating action: {e}")
-            return False # Fail safe
+            return {"approved": False, "risk_score": 100, "risk_level": "CRITICAL", "reason": f"Validation error: {e}"}
+
+    # =====================================================================
+    #  LAYER 4: EXPLAINABLE AI (LLM-Generated Explanations)
+    # =====================================================================
+
+    async def _generate_xai_explanation(self, action_model, validation_result: dict):
+        """
+        Generate a human-readable explanation of WHY an action was blocked.
+        Uses the LLM to translate risk scores and policy violations into natural language.
+        """
+        try:
+            if not self._xai_llm:
+                return
+
+            action_data = action_model.model_dump(exclude_none=True)
+            risk_score = validation_result.get("risk_score", "?")
+            reason = validation_result.get("reason", "Unknown")
+            breakdown = validation_result.get("breakdown", {})
+
+            xai_prompt = f"""You are a cybersecurity analyst. A browser automation agent had an action BLOCKED by the security system. 
+Write a clear, 2-3 sentence explanation for the human operator explaining:
+1. WHAT the agent tried to do
+2. WHY it was blocked
+3. What the RISK was
+
+Action attempted: {json.dumps(action_data, default=str)[:300]}
+Risk Score: {risk_score}/100
+Block Reason: {reason}
+Risk Breakdown: {json.dumps(breakdown, default=str)}
+Current security state: {self.security_state}
+
+Write ONLY the explanation, no headers or formatting. Be concise and specific."""
+
+            from langchain_core.messages import HumanMessage
+            response = await self._xai_llm.ainvoke([HumanMessage(content=xai_prompt)])
+            explanation = response.content.strip()
+
+            logger.info(f"📋 XAI Explanation: {explanation}")
+            
+            SecurityLogger.log_event(
+                event_type="XAI_EXPLANATION",
+                url=getattr(self, 'last_logged_url', '') or '',
+                details=explanation,
+                risk_level=validation_result.get("risk_level", "HIGH"),
+                risk_score=risk_score,
+                action="EXPLAINED",
+                explanation=explanation
+            )
+
+        except Exception as e:
+            logger.debug(f"XAI explanation generation failed (non-critical): {e}")

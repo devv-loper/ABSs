@@ -53,10 +53,22 @@ window.Sentinel = {
         }
         
         // Check 3: Semantic Analysis for Prompt Injection (Vector 1) - ANY ELEMENT
-        // Move this outside the "Leaf Node" check so it catches <p> with <b> tags.
+        // Expanded keyword list to catch common bypass variants
         const text = element.textContent.toUpperCase();
-        if (text.includes("IGNORE PREVIOUS") || text.includes("SYSTEM OVERRIDE") || text.includes("NEW DIRECTIVE") || text.includes("SYSTEM COMMAND") || text.includes("IGNORE USER GOAL")) {
-             return "HIDDEN_PROMPT_INJECTION";
+        const injectionKeywords = [
+            "IGNORE PREVIOUS", "SYSTEM OVERRIDE", "NEW DIRECTIVE", 
+            "SYSTEM COMMAND", "IGNORE USER GOAL",
+            "FORGET YOUR INSTRUCTIONS", "DISREGARD PREVIOUS",
+            "YOU ARE NOW", "ACT AS A DIFFERENT", "PRETEND YOU ARE",
+            "JAILBREAK", "ROLEPLAY AS", "SWITCH TO MODE",
+            "SEND THE DATA TO", "EXFILTRATE", "TRANSMIT TO",
+            "REVEAL YOUR SYSTEM PROMPT", "SHOW YOUR INSTRUCTIONS",
+            "OVERRIDE PREVIOUS", "UPDATED INSTRUCTIONS"
+        ];
+        for (const keyword of injectionKeywords) {
+            if (text.includes(keyword)) {
+                return "HIDDEN_PROMPT_INJECTION";
+            }
         }
         
         // Check 4: Tiny Text / Formatting (Font Size < 2px)
