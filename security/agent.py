@@ -394,7 +394,22 @@ class SecureAgent(Agent):
 
             def secure_llm_representation(*args, **kwargs):
                 raw_text = original_llm_rep(*args, **kwargs)
-                return self._sanitize_text(raw_text)
+                sanitized_text = self._sanitize_text(raw_text)
+                
+                # --- Historical DOM Diff Tracing ---
+                try:
+                    import time
+                    diff_dir = os.path.join(os.path.dirname(__file__), "dashboard", "diffs")
+                    os.makedirs(diff_dir, exist_ok=True)
+                    ts = int(time.time() * 1000)
+                    with open(os.path.join(diff_dir, f"diff_{ts}_raw.txt"), "w", encoding="utf-8") as f:
+                        f.write(raw_text)
+                    with open(os.path.join(diff_dir, f"diff_{ts}_sanitized.txt"), "w", encoding="utf-8") as f:
+                        f.write(sanitized_text)
+                except Exception as e:
+                    logger.error(f"Failed to record DOM trace: {e}")
+
+                return sanitized_text
 
             summary.dom_state.llm_representation = secure_llm_representation
 

@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string, send_file
+from flask import Flask, request, render_template_string, send_file, abort
 import time
 import os
 
@@ -15,13 +15,11 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <h1>Security Testbench</h1>
-    <p>Enhanced Vector Suite</p>
+    <p>Directory Listing:</p>
     <ul>
-        <li><a href="/injection">Test 1: Visible Prompt Injection</a></li>
-        <li><a href="/hidden">Test 2: Hidden Prompt Injection</a></li>
-        <li><a href="/phishing">Test 3: Phishing / Fake Form</a></li>
-        <li><a href="/clickjacking">Test 4: Clickjacking / Deceptive UI</a></li>
-        <li><a href="/dynamic">Test 5: Dynamic Content Injection</a></li>
+        {% for file in files %}
+        <li><a href="/test/{{ file }}">{{ file }}</a></li>
+        {% endfor %}
     </ul>
 </body>
 </html>
@@ -29,27 +27,18 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def home():
-    return render_template_string(HTML_TEMPLATE)
+    files = [f for f in os.listdir('.') if f.endswith('.html')]
+    return render_template_string(HTML_TEMPLATE, files=files)
 
-@app.route('/injection')
-def injection():
-    return send_file('vector_1_prompt_injection.html')
-
-@app.route('/hidden')
-def hidden():
-    return send_file('vector_2_hidden_css.html')
-
-@app.route('/phishing')
-def phishing():
-    return send_file('vector_5_phishing.html')
-
-@app.route('/clickjacking')
-def clickjacking():
-    return send_file('vector_3_clickjacking.html')
-
-@app.route('/dynamic')
-def dynamic():
-    return send_file('vector_4_dynamic_injection.html')
+@app.route('/test/<path:filename>')
+def serve_file(filename):
+    if not filename.endswith('.html') or '..' in filename or filename.startswith('/'):
+        abort(400)
+    
+    if os.path.exists(filename):
+        return send_file(filename)
+    else:
+        abort(404)
 
 @app.route('/steal_creds', methods=['POST'])
 def steal_creds():

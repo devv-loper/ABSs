@@ -1,51 +1,29 @@
-# Python Standard
+# Environment
+.env
+.venv/
+venv/
+ENV/
+env/
+
+# Python Cache
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
 
-# Virtual Environments
-venv/
-.venv/
-.venv_wsl/
-env/
-ENV/
-
-# Environment Variables & Secrets
-.env
-.env.backend
-.env.local
-
-# IDE Settings
-.vscode/
-.idea/
-*.swp
-
-# Project Logs and Data
-*.log
+# Dashboard dynamically generated evidence
 security/dashboard/security_events.jsonl
-
-# Generated Evidence (Screenshots)
-# Keep the directory, exclude the files
+security/dashboard/pids.json
+security/dashboard/kill.flag
+security/dashboard/diffs/*
+!security/dashboard/diffs/.gitkeep
 security/dashboard/screenshots/*
 !security/dashboard/screenshots/.gitkeep
 
-# Streamlit
-.streamlit/
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store

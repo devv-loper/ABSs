@@ -25,7 +25,12 @@ async def example():
         model=os.getenv("BROWSER_USE_MODEL", "bu-latest"),
         api_key=os.getenv("BROWSER_USE_API_KEY"),
     )
-    logger.info(f"🛡️ Initializing Secure Agent with ChatBrowserUse ({llm.model})...")
+    
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    guardrail_llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.2)
+    
+    logger.info(" Dual LLM Orchestration Flow: Base Agent (browser-use) + Guardrail Auditor (Gemini 1.5 Pro)")
+    logger.info(f" Initializing Secure Agent with ChatBrowserUse ({llm.model})...")
 
     # CONSTITUTIONAL AI: The "Prime Directive" for the Agent
     HARDENED_SYSTEM_PROMPT = """
@@ -49,13 +54,14 @@ async def example():
     task = default_task
     if len(sys.argv) > 1:
         task = " ".join(sys.argv[1:])
-        logger.info(f"📋 Custom Task: {task}")
+        logger.info(f" Custom Task: {task}")
     else:
-        logger.info("📋 Using Default Security Test Task")
+        logger.info(" Using Default Security Test Task")
 
     agent = SecureAgent(
         task=task,
         llm=llm,
+        guardrail_llm=guardrail_llm,
         browser=browser,
         extend_system_message=HARDENED_SYSTEM_PROMPT,
         use_vision=False,

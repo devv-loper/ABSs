@@ -49,11 +49,25 @@ class SecurityLogger:
             "explanation": explanation,
         }
 
+        lock_file = LOG_FILE.with_name(LOG_FILE.name + ".lock")
+        while True:
+            try:
+                fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                break
+            except OSError:
+                time.sleep(0.05)
+
         try:
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception as e:
             print(f"Failed to write security log: {e}")
+        finally:
+            try:
+                os.unlink(str(lock_file))
+            except OSError:
+                pass
 
     @staticmethod
     def get_screenshot_dir():
