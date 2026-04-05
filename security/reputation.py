@@ -71,7 +71,7 @@ class ReputationManager:
         # This implementation assumes Zero Trust.
         logger.info(f"Unknown domain ({domain}). Treating as HOSTILE.")
         return False
-
+pip install langchain-google-genai
     def _query_virustotal(self, domain: str) -> bool:
         try:
             url = f"https://www.virustotal.com/api/v3/domains/{domain}"

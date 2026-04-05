@@ -63,6 +63,8 @@ def install_dependencies():
     print("\n📦 Installing dependencies from requirements.txt...")
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        print("\n📦 Installing explicitly: langchain-google-genai...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "langchain-google-genai"])
         print("\n Dependencies installed successfully!")
         time.sleep(2)
     except subprocess.CalledProcessError:
